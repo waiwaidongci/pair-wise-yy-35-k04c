@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, STATES, escalation_required
 
 
 class Repository:
@@ -54,6 +54,15 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS dose_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    previous_quantity REAL NOT NULL,
+                    new_quantity REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +75,19 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        with self._lock, self.conn:
+            cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(items)")}
+            if "escalation_flagged" not in cols:
+                self.conn.execute(
+                    "ALTER TABLE items ADD COLUMN escalation_flagged INTEGER NOT NULL DEFAULT 0")
+                self.conn.execute(
+                    """UPDATE items SET escalation_flagged=1
+                       WHERE severity='critical' OR (threshold>0 AND quantity>=threshold)""")
+            if "closure_note" not in cols:
+                self.conn.execute("ALTER TABLE items ADD COLUMN closure_note TEXT")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -75,14 +97,16 @@ class Repository:
                     quantity: float, threshold: float, external_ref: Optional[str],
                     actor: str) -> Dict[str, Any]:
         now = utc_now()
+        flagged = 1 if escalation_required(severity, quantity, threshold) else 0
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       status, version, external_ref, created_by, created_at, updated_at,
+                       escalation_flagged)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                     external_ref, actor, now, now, flagged),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
@@ -108,20 +132,64 @@ class Repository:
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str, closure_note: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
-            cur = self.conn.execute(
-                """UPDATE items SET status=?, version=version+1, updated_at=?
-                   WHERE id=? AND version=?""",
-                (target, now, item_id, expected_version),
-            )
+            if closure_note is not None:
+                cur = self.conn.execute(
+                    """UPDATE items SET status=?, version=version+1, updated_at=?,
+                       closure_note=? WHERE id=? AND version=?""",
+                    (target, now, closure_note, item_id, expected_version),
+                )
+            else:
+                cur = self.conn.execute(
+                    """UPDATE items SET status=?, version=version+1, updated_at=?
+                       WHERE id=? AND version=?""",
+                    (target, now, item_id, expected_version),
+                )
             if cur.rowcount == 0:
                 exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
                 if exists is None:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def correct_quantity(self, item_id: int, new_quantity: float, reason: str,
+                         expected_version: int, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            row = self.conn.execute(
+                "SELECT quantity, severity, threshold, escalation_flagged FROM items WHERE id=?",
+                (item_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("项目不存在")
+            previous = float(row["quantity"])
+            sticky = bool(row["escalation_flagged"]) or escalation_required(
+                row["severity"], new_quantity, row["threshold"])
+            cur = self.conn.execute(
+                """UPDATE items SET quantity=?, version=version+1, updated_at=?,
+                   escalation_flagged=? WHERE id=? AND version=?""",
+                (new_quantity, now, 1 if sticky else 0, item_id, expected_version),
+            )
+            if cur.rowcount == 0:
+                raise ConflictError("版本冲突，请刷新后重试")
+            cur = self.conn.execute(
+                """INSERT INTO dose_corrections(item_id, previous_quantity, new_quantity,
+                   reason, created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, previous, new_quantity, reason, actor, now),
+            )
+            correction_id = int(cur.lastrowid)
+        correction = self.list_corrections(item_id)[-1]
+        return {"item": self.get_item(item_id), "correction": correction}
+
+    def list_corrections(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:

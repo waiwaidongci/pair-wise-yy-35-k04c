@@ -1,1 +1,189 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>职业辐射剂量与异常事件</h1><p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限</p><p>剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>职业辐射剂量与异常事件</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:960px;margin:1.5rem auto;padding:0 1rem;color:#17212b;background:#fff}
+h1{font-size:1.35rem;margin-bottom:.2rem}
+.muted{color:#5b6b7b;font-size:.9rem}
+.bar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin:1rem 0;padding:.7rem .8rem;background:#f4f7f9;border-radius:6px}
+select,input,textarea{font:inherit;padding:.4rem .5rem;border:1px solid #c4cdd5;border-radius:4px;box-sizing:border-box}
+button{padding:.45rem .9rem;font:inherit;border:1px solid #3a6ea5;background:#3a6ea5;color:#fff;border-radius:4px;cursor:pointer}
+button.ghost{background:#fff;color:#3a6ea5}
+button:disabled{opacity:.45;cursor:not-allowed}
+table{border-collapse:collapse;width:100%;font-size:.9rem}
+th,td{border-bottom:1px solid #e2e8ee;padding:.5rem .55rem;text-align:left;vertical-align:top}
+th{background:#f4f7f9}
+tr.clickable{cursor:pointer}
+tr.clickable:hover{background:#f4f9ff}
+.card{border:1px solid #d8e0e8;border-radius:6px;padding:1rem;margin:.8rem 0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.6rem}
+.kv .k{color:#5b6b7b;font-size:.8rem}
+.kv .v{font-weight:600}
+.badge{display:inline-block;padding:.1rem .5rem;border-radius:10px;font-size:.78rem;background:#e8eef4}
+.badge.hot{background:#fde2e2;color:#a02020}
+.badge.sticky{background:#fff1d6;color:#8a5a00}
+.badge.ok{background:#e0f2e6;color:#1e6b35}
+.warn{background:#fff7e8;border:1px solid #e8c479;border-radius:6px;padding:.6rem .8rem;margin:.6rem 0;font-size:.9rem}
+.err{background:#fde2e2;border:1px solid #d98b8b;border-radius:6px;padding:.6rem .8rem;margin:.6rem 0;font-size:.9rem;white-space:pre-wrap}
+label{display:block;font-size:.85rem;margin:.5rem 0 .2rem;color:#33424f}
+textarea{width:100%;min-height:64px}
+pre{background:#f4f7f9;padding:.8rem;overflow:auto;font-size:.82rem;border-radius:6px}
+a{color:#3a6ea5;cursor:pointer}
+small.ts{color:#8494a3}
+</style>
+</head>
+<body>
+<h1>职业辐射剂量与异常事件</h1>
+<p class="muted">合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限。剂量与调查水平之比决定升级程度；剂量更正保留原值与每次更正的完整轨迹，审计一路可查。进入调查后不得借更正退回，原先已触发的升级只由健康物理师在关闭说明中处置。</p>
+<div class="bar">
+  <label style="margin:0">操作人 <input id="actor" value="demo" size="10"></label>
+  <label style="margin:0">角色
+    <select id="role">
+      <option value="dosimetrist">剂量师 dosimetrist</option>
+      <option value="radiation_officer">主管 radiation_officer</option>
+      <option value="health_physicist" selected>健康物理师 health_physicist</option>
+      <option value="viewer">viewer</option>
+    </select>
+  </label>
+  <button class="ghost" onclick="showList()">返回列表</button>
+  <button class="ghost" onclick="showAudit()">审计日志</button>
+  <span id="who" class="muted"></span>
+</div>
+<div id="err"></div>
+<div id="view"></div>
+
+<script>
+const $=id=>document.getElementById(id);
+const state={};
+function headers(){return {'X-Actor':$('actor').value.trim()||'anonymous','X-Role':$('role').value,'Content-Type':'application/json'};}
+function showError(m){$('err').innerHTML=m?`<div class="err">${escapeHtml(m)}</div>`:'';}
+function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function api(method,url,body){
+  const opt={method,headers:headers()};
+  if(body)opt.body=JSON.stringify(body);
+  const r=await fetch(url,opt); const data=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error(data.message||data.error||('HTTP '+r.status));
+  return data;
+}
+async function run(fn){try{showError('');await fn();}catch(e){showError(e.message);}}
+function escBadge(it){
+  const tags=[];
+  if(it.prior_escalation)tags.push('<span class="badge sticky">已触发升级（粘性）</span>');
+  if(it.escalation_required)tags.push('<span class="badge hot">当前需升级</span>');
+  if(!it.escalation_required&&!it.prior_escalation)tags.push('<span class="badge ok">未达升级线</span>');
+  return tags.join(' ');
+}
+function ts(t){return t?`<small class="ts">${escapeHtml(t.replace('T',' ').replace('+00:00','Z'))}</small>`:'';}
+
+async function showList(){
+  const data=await api('GET','/api/items'); state.items=data.items;
+  const rows=state.items.map(it=>`<tr class="clickable" onclick="showDetail(${it.id})">
+    <td>#${it.id} ${escapeHtml(it.title)}<br><small class="ts">${escapeHtml(it.status)} · v${it.version}</small></td>
+    <td>${escapeHtml(it.severity)}</td>
+    <td><b>${it.quantity}</b> / ${it.threshold}<br><small class="ts">比值 ${it.ratio.toFixed(2)}</small></td>
+    <td>${it.priority}</td>
+    <td>${it.deadline_hours}h</td>
+    <td>${escBadge(it)}</td>
+  </tr>`).join('');
+  $('view').innerHTML=`<div class="card"><table>
+    <thead><tr><th>事件</th><th>等级</th><th>当前读数/阈值</th><th>优先级</th><th>期限</th><th>升级</th></tr></thead>
+    <tbody>${rows||'<tr><td colspan="6" class="muted">暂无事件</td></tr>'}</tbody></table></div>`;
+}
+
+async function showDetail(id){
+  const it=await api('GET','/api/items/'+id); state.item=it;
+  let corrRows='';
+  if(it.corrections.length){
+    corrRows=`<table><thead><tr><th>#</th><th>原读数</th><th>新读数</th><th>说明</th><th>更正人</th><th>时间</th></tr></thead><tbody>`+
+      it.corrections.map(c=>`<tr><td>${c.id}</td><td>${c.previous_quantity}</td><td><b>${c.new_quantity}</b></td>
+        <td>${escapeHtml(c.reason)}</td><td>${escapeHtml(c.created_by)}</td><td>${ts(c.created_at)}</td></tr>`).join('')+
+      `</tbody></table>`;
+  }else corrRows='<p class="muted">尚无更正，当前读数即原始读数。</p>';
+  const corrected=it.corrections.length>0;
+  const canCorrect=($('role').value==='dosimetrist')&&['recorded','reviewing'].includes(it.status);
+  const stickyBlock=it.prior_escalation&&!it.escalation_required
+    ? `<div class="warn">最近一次更正后比值已降到升级线以下，但此前已触发升级，不能借更正退回；只能由健康物理师在关闭说明中处置。</div>`:'';
+  $('view').innerHTML=`
+    <div class="card">
+      <h2 style="margin-top:0">#${it.id} ${escapeHtml(it.title)}</h2>
+      <div class="grid kv">
+        <div><div class="k">状态 / 版本</div><div class="v">${escapeHtml(it.status)} · v${it.version}</div></div>
+        <div><div class="k">等级</div><div class="v">${escapeHtml(it.severity)}</div></div>
+        <div><div class="k">原始读数</div><div class="v">${it.original_quantity}</div></div>
+        <div><div class="k">当前读数 / 阈值</div><div class="v">${it.quantity} / ${it.threshold}（比值 ${it.ratio.toFixed(2)}）</div></div>
+        <div><div class="k">优先级 / 期限</div><div class="v">${it.priority} / ${it.deadline_hours}h</div></div>
+        <div><div class="k">升级判定</div><div class="v">${escBadge(it)}</div></div>
+      </div>
+      <p>${escapeHtml(it.description)}</p>
+      ${it.closure_note?`<div class="card" style="background:#f4f9ff"><b>关闭说明（健康物理师）：</b> ${escapeHtml(it.closure_note)}</div>`:''}
+      ${stickyBlock}
+      <div id="transition"></div>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">剂量更正</h3>
+      ${corrRows}
+      <div id="correctionForm"></div>
+      ${canCorrect?`
+        <label>新读数（仪器复测或录入纠错后的剂量）</label>
+        <input id="newq" type="number" step="any" min="0" value="${it.quantity}">
+        <label>更正说明（复测来源 / 纠错原因）</label>
+        <textarea id="reason" placeholder="例如：仪器复测读数；原录入笔误……"></textarea>
+        <p><button onclick="submitCorrection(${it.id})">提交更正</button>
+           <small class="ts">提交后按最新读数重算优先级、期限与升级；原值与本次更正按时间保留并写入审计。</small></p>`
+        : (corrected&&!['recorded','reviewing'].includes(it.status)
+            ? '<p class="muted">事件已进入调查流程，不能再更正读数。</p>'
+            : '<p class="muted">仅剂量师在登记/复核阶段可更正读数。</p>')}
+    </div>
+    <p><a onclick="showAuditFor(${it.id})">查看本事件审计轨迹</a></p>`;
+  renderTransition(it);
+}
+
+function renderTransition(it){
+  const next={recorded:['reviewing'],reviewing:['investigation'],investigation:['follow_up'],follow_up:['closed'],closed:[]}[it.status]||[];
+  if(!next.length){$('transition').innerHTML='<p class="muted">流程已结束。</p>';return;}
+  const role=$('role').value;
+  const needNote=it.status==='follow_up'&&it.prior_escalation;
+  $('transition').innerHTML=next.map(t=>{
+    const allowed={reviewing:['radiation_officer'],investigation:['radiation_officer'],follow_up:['health_physicist'],closed:['health_physicist']}[t];
+    const disabled=!allowed.includes(role);
+    const label={reviewing:'提交复核',investigation:'进入调查',follow_up:'转健康物理师随访',closed:'关闭事件'}[t];
+    return `<button ${disabled?'disabled':''} onclick="doTransition(${it.id},'${t}')">${label}</button>`;
+  }).join(' ')
+    +(needNote?`<div class="warn">该事件曾触发升级（即使更正后比值已降到线下），关闭时必须由健康物理师填写处置说明。
+       <label>关闭说明</label><textarea id="closureNote"></textarea></div>`:'')
+    +(role!=='health_physicist'&&it.status==='follow_up'?'<p class="muted">关闭只能由健康物理师执行。</p>':'');
+}
+
+async function submitCorrection(id){
+  await run(async()=>{
+    const newq=parseFloat($('newq').value); const reason=$('reason').value;
+    await api('POST',`/api/items/${id}/corrections`,{new_quantity:newq,reason,expected_version:state.item.version});
+    await showDetail(id);
+  });
+}
+
+async function doTransition(id,target){
+  await run(async()=>{
+    const body={target,expected_version:state.item.version};
+    const noteEl=$('closureNote');
+    if(target==='closed'&&noteEl)body.closure_note=noteEl.value;
+    await api('POST',`/api/items/${id}/transition`,body);
+    await showDetail(id);
+  });
+}
+
+function renderEvents(events){
+  if(!events.length)return '<p class="muted">暂无审计事件。</p>';
+  return '<pre>'+escapeHtml(events.map(e=>`#${e.id} ${e.created_at} ${e.action} ${e.entity_type}#${e.entity_id} by ${e.actor}\n`+
+    JSON.stringify(e.detail,null,2)).join('\n\n  ↓\n\n'))+'</pre>';
+}
+async function showAudit(){await run(async()=>{$('view').innerHTML='<p class="muted">加载中…</p>';$('view').innerHTML=`<div class="card"><h3 style="margin-top:0">审计日志（哈希链）</h3>${renderEvents((await api('GET','/api/audit')).events)}</div>`;});}
+async function showAuditFor(id){await run(async()=>{$('view').innerHTML='<p class="muted">加载中…</p>';$('view').innerHTML=`<div class="card"><h3 style="margin-top:0">#${id} 审计轨迹</h3>${renderEvents((await api('GET',`/api/items/${id}/audit`)).events)}</div><p><a onclick="showDetail(${id})">返回详情</a></p>`;});}
+
+showList();
+</script>
+</body>
+</html>

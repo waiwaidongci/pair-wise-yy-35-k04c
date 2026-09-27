@@ -13,7 +13,8 @@ class WorkflowTest(unittest.TestCase):
         self.service.add_record(item["id"],{"kind":"evidence","detail":"evidence registered","status":"closed","external_ref":"EV-1"},"recorder",'radiation_officer')
         current=item
         for target in STATES[1:]:
-            current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0])
+            note={"closure_note":"升级事件关闭处置说明"} if target==STATES[-1] else {}
+            current=self.service.transition(current["id"],target,current["version"],"reviewer",TRANSITION_ROLES[target][0],**note)
         self.assertEqual(current["status"],STATES[-1])
         self.assertEqual(len(self.service.list_records(current["id"],"viewer")),1)
         events=self.service.audit("viewer",current["id"]); self.assertGreaterEqual(len(events),len(STATES)+1); self.assertTrue(self.repo.verify_audit_chain())
