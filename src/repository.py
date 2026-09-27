@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, STATES, escalation_required
 
 
 class Repository:
@@ -36,6 +36,8 @@ class Repository:
                     status TEXT NOT NULL CHECK(status IN ({statuses})),
                     version INTEGER NOT NULL DEFAULT 1,
                     external_ref TEXT,
+                    escalation_locked INTEGER NOT NULL DEFAULT 0,
+                    closure_note TEXT,
                     created_by TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -54,6 +56,15 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS dose_corrections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    previous_quantity REAL NOT NULL,
+                    new_quantity REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +77,28 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            self._migrate_columns()
+
+    def _migrate_columns(self) -> None:
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(items)")}
+        added = False
+        if "escalation_locked" not in existing:
+            self.conn.execute(
+                "ALTER TABLE items ADD COLUMN escalation_locked INTEGER NOT NULL DEFAULT 0")
+            added = True
+        if "closure_note" not in existing:
+            self.conn.execute("ALTER TABLE items ADD COLUMN closure_note TEXT")
+        if added:
+            # 旧库中已超阈值（或严重程度最高）的存量事件视为曾触发升级，按新规锁存
+            rows = self.conn.execute(
+                "SELECT id, severity, quantity, threshold, status FROM items"
+            ).fetchall()
+            for row in rows:
+                locked = escalation_required(
+                    row["severity"], row["quantity"], row["threshold"])
+                self.conn.execute(
+                    "UPDATE items SET escalation_locked=? WHERE id=?",
+                    (1 if locked else 0, row["id"]))
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -73,48 +106,66 @@ class Repository:
 
     def create_item(self, title: str, description: str, severity: str,
                     quantity: float, threshold: float, external_ref: Optional[str],
-                    actor: str) -> Dict[str, Any]:
+                    escalation_locked: bool, actor: str) -> Dict[str, Any]:
         now = utc_now()
         try:
             with self._lock, self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO items(title, description, severity, quantity, threshold,
-                       status, version, external_ref, created_by, created_at, updated_at)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                       status, version, external_ref, escalation_locked, created_by,
+                       created_at, updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (title, description, severity, quantity, threshold, STATES[0], 1,
-                     external_ref, actor, now, now),
+                     external_ref, 1 if escalation_locked else 0, actor, now, now),
                 )
                 item_id = int(cur.lastrowid)
         except sqlite3.IntegrityError as exc:
             raise ConflictError("external_ref已存在") from exc
         return self.get_item(item_id)
 
+    _ITEM_SELECT = """
+        SELECT items.*,
+               COALESCE(dc.new_quantity, items.quantity) AS effective_quantity,
+               dc.id AS last_correction_id
+        FROM items
+        LEFT JOIN dose_corrections dc
+            ON dc.id = (SELECT MAX(id) FROM dose_corrections WHERE item_id = items.id)
+    """
+
     def get_item(self, item_id: int) -> Dict[str, Any]:
         with self._lock:
-            row = self.conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            row = self.conn.execute(
+                self._ITEM_SELECT + " WHERE items.id=?", (item_id,)).fetchone()
         if row is None:
             raise NotFoundError("项目不存在")
         return self._item(row)
 
     def list_items(self, status: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM items"
+        sql = self._ITEM_SELECT
         params: tuple = ()
         if status:
-            sql += " WHERE status=?"
+            sql += " WHERE items.status=?"
             params = (status,)
-        sql += " ORDER BY id DESC"
+        sql += " ORDER BY items.id DESC"
         with self._lock:
             rows = self.conn.execute(sql, params).fetchall()
         return [self._item(row) for row in rows]
 
     def transition_item(self, item_id: int, target: str, expected_version: int,
-                        actor: str) -> Dict[str, Any]:
+                        actor: str, closure_note: Optional[str] = None) -> Dict[str, Any]:
         now = utc_now()
         with self._lock, self.conn:
+            if closure_note is None:
+                update_sql = "UPDATE items SET status=?, version=version+1, updated_at=?"
+                params = (target, now)
+            else:
+                update_sql = (
+                    "UPDATE items SET status=?, version=version+1, updated_at=?, "
+                    "closure_note=?")
+                params = (target, now, closure_note)
             cur = self.conn.execute(
-                """UPDATE items SET status=?, version=version+1, updated_at=?
-                   WHERE id=? AND version=?""",
-                (target, now, item_id, expected_version),
+                update_sql + " WHERE id=? AND version=?",
+                params + (item_id, expected_version),
             )
             if cur.rowcount == 0:
                 exists = self.conn.execute("SELECT 1 FROM items WHERE id=?", (item_id,)).fetchone()
@@ -122,6 +173,34 @@ class Repository:
                     raise NotFoundError("项目不存在")
                 raise ConflictError("版本冲突，请刷新后重试")
         return self.get_item(item_id)
+
+    def add_correction(self, item_id: int, previous_quantity: float, new_quantity: float,
+                       reason: str, lock_escalation: bool, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO dose_corrections(item_id, previous_quantity, new_quantity,
+                   reason, created_by, created_at) VALUES(?,?,?,?,?,?)""",
+                (item_id, previous_quantity, new_quantity, reason, actor, now),
+            )
+            correction_id = int(cur.lastrowid)
+            self.conn.execute(
+                """UPDATE items SET version=version+1, updated_at=?,
+                   escalation_locked = escalation_locked OR ? WHERE id=?""",
+                (now, 1 if lock_escalation else 0, item_id),
+            )
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE id=?", (correction_id,)).fetchone()
+        return dict(row)
+
+    def list_corrections(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM dose_corrections WHERE item_id=? ORDER BY id",
+                (item_id,)).fetchall()
+        return [dict(row) for row in rows]
 
     def add_record(self, item_id: int, kind: str, detail: str, status: str,
                    external_ref: Optional[str], actor: str) -> Dict[str, Any]:

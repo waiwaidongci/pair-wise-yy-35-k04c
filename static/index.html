@@ -1,1 +1,45 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.55rem 1rem}</style></head><body><h1>职业辐射剂量与异常事件</h1><p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限</p><p>剂量与调查水平之比决定升级程度，超过阈值必须进入调查；更正剂量不能覆盖已确认审计记录。</p><button onclick="loadItems()">刷新列表</button><pre id="out">使用X-Actor和X-Role请求头调用接口。</pre><script>async function loadItems(){const r=await fetch('/api/items',{headers:{'X-Actor':'demo','X-Role':'viewer'}});document.getElementById('out').textContent=JSON.stringify(await r.json(),null,2)}</script></body></html>
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>职业辐射剂量与异常事件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:900px;margin:2rem auto;padding:0 1rem;color:#17212b}pre{background:#f4f7f9;padding:1rem;overflow:auto}button{padding:.45rem .9rem;margin:.2rem .2rem .2rem 0}input,textarea,select{padding:.4rem;margin:.2rem;width:140px}.lock{color:#b00020;font-weight:600}.row{border-bottom:1px solid #dde3e8;padding:.6rem 0}</style></head><body>
+<h1>职业辐射剂量与异常事件</h1>
+<p>合并监测读数，比较历史剂量并管理超限调查、医学随访与报告期限。</p>
+<p>仪器复测或录入纠错由<b>剂量师</b>填写剂量更正：新读数与说明按时间留痕；列表、优先级、期限与升级判断按最近一次更正计算。更正不能回退状态；曾触发升级的事件即使比值降回线下，也只能由健康物理师在关闭说明中处置。</p>
+<p>角色：<select id="role"><option value="dosimetrist">dosimetrist 剂量师</option><option value="radiation_officer">radiation_officer 主管</option><option value="health_physicist">health_physicist 健康物理师</option><option value="viewer">viewer</option></select>
+ 操作者：<input id="actor" value="demo" style="width:100px"> <button onclick="loadItems()">刷新列表</button></p>
+<div id="list"></div><div id="detail"></div><pre id="out"></pre>
+<script>
+const h={},json=(o)=>JSON.stringify(o);
+function headers(){return {'X-Actor':actor.value,'X-Role':role.value,'Content-Type':'application/json'}}
+async function api(path,method='GET',body){const r=await fetch(path,{method,headers:headers(),body:body?json(body):undefined});return {status:r.status,data:await r.json()}}
+async function loadItems(){
+  const {data}=await api('/api/items');
+  list.innerHTML=data.items.map(i=>`<div class="row"><button onclick="loadDetail(${i.id})">详情</button>
+    ${i.status==='closed'?'🔒':''} #${i.id} ${i.title}
+    读数 <s>${i.original_quantity}</s>→<b>${i.current_quantity}</b> / ${i.threshold}
+    状态=${i.status} 优先级=${i.priority} 期限=${i.deadline_hours}h
+    升级=${i.escalation_required?'是':'否'} ${i.escalation_locked?'<span class="lock">已锁存（必须关闭说明）</span>':''}</div>`).join('');
+}
+async function loadDetail(id){
+  const {data:item}=await api('/api/items/'+id);
+  const hist=item.corrections.map(c=>`<div class="row">${c.created_at} ${c.created_by}：${c.previous_quantity}→${c.new_quantity}<br><i>${c.reason}</i></div>`).join('')||'<p>暂无更正，保留原始读数 '+item.original_quantity+'</p>';
+  const targets={recorded:'reviewing',reviewing:'investigation',investigation:'follow_up',follow_up:'closed'}[item.status];
+  detail.innerHTML=`<h2>#${item.id} ${item.title}（${item.status}，version ${item.version}）</h2>
+    <p>原始读数：${item.original_quantity}；当前读数：<b>${item.current_quantity}</b>；阈值：${item.threshold}</p>
+    <h3>剂量更正（剂量师填写）</h3>${hist}
+    <input id="nq" type="number" step="0.01" placeholder="新读数">
+    <input id="rs" placeholder="更正说明（复测/纠错原因）" style="width:280px">
+    <button onclick="correct(${item.id})">提交更正</button>
+    ${targets?`<h3>状态推进 → ${targets}</h3>${targets==='closed'?'<input id="cn" placeholder="健康物理师关闭说明（锁存升级必填）" style="width:340px">':''}
+    <button onclick="move(${item.id},'${targets}')">推进到 ${targets}</button>`:'<p>事件已关闭</p>'}
+    <pre>${json(item,null,2)}</pre>`;
+}
+async function correct(id){
+  const r=await api('/api/items/'+id+'/corrections','POST',{new_quantity:parseFloat(nq.value),reason:rs.value});
+  out.textContent=json(r.data,null,2); if(r.status===201){loadItems();loadDetail(id)}
+}
+async function move(id,target){
+  const cur=await (await fetch('/api/items/'+id,{headers:headers()})).json();
+  const body={target,expected_version:cur.version}; const cn=document.getElementById('cn'); if(cn)body.closure_note=cn.value;
+  const r=await api('/api/items/'+id+'/transition','POST',body);
+  out.textContent=json(r.data,null,2); if(r.status===200){loadItems();loadDetail(id)}
+}
+loadItems();
+</script></body></html>
